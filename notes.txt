@@ -1,0 +1,33 @@
+number of fires - $00AB  - reward on decrement, big reward on 0 (but not in menu)
+in-level - $0018 , $001C, $00D0 - use to disable/ fix rewards in menu
+$06A9 - zero on level completion
+
+How to handle menu?
+Need to penalise entering already completed level
+Need to penalise being in menu
+Need to reward being in game in an uncompleted level (small initial reward?)
+
+
+How to track number of completed levels? -  $00B5 is level - 1, e.g. 9 for world 1 castle
+$00D4 is world number -1  - when in level
+e.g. final stage 10-10 world 10 castle has $00B5 (level-1 within world) = 9, and $00D4=9 (world-1)
+$0400 is bitmask world 1 1-8 (0-255)
+1 1-9 completion sets $0401 to 65 , castle completion sets $0401 to 195
+World 2 2-1 completion sets $0402 to 1
+
+
+$0324 and $0328 are 1 when on level select menu
+$031D and $0321 set to 1 when paused in level
+
+$0003 is 8 when death animation playing
+Can also detect pause with $0003 = 2
+
+so need big reward from increasing memory values in $0400 range
+e.g. $0400 = 255 (FF) , $0401 = 195 (C3), $0402 = 255 (FF) etc. in pairs until $0410 = 255 (FF), $0411 = 195 (C3)
+Then same for unlocked World 10 - $0412 = 255, $0413 = C3
+Only need left, right, A for gameplay
+May need B and Start for menu navigation
+
+ROM (sha256): 197833f0ac0e87a824f008bdaf5e429b9688a5dbfee0b65cb6b731e1a3ee77e5  Fire 'n Ice (USA).nes
+
+
