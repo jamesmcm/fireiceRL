@@ -81,7 +81,7 @@ class FCEUXProcessManager:
             cmd: List[str] = [fceux_path, "--loadlua", lua_script, rom_path]
             if self.config.extra_args:
                 # Insert additional arguments after the executable but before ROM.
-                cmd = [fceux_path, *self.config.extra_args, "--loadlua", lua_script, rom_path]
+                cmd = [fceux_path, *self.config.extra_args,"--sound", "0", "--loadlua", lua_script, rom_path]
 
             proc = subprocess.Popen(
                 cmd,

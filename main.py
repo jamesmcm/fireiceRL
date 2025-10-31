@@ -6,17 +6,24 @@ from typing import List, Optional
 
 from fireicerl.bridge import FCEUXConfig
 from fireicerl.environment import FireIceEnv, FireIceEnvConfig
+from fireicerl.dqn import DQNConfig, DQNTrainer
 from fireicerl.launcher import FCEUXLaunchConfig, FCEUXProcessManager
 from fireicerl.ppo import PPOConfig, PPOTrainer
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="PPO agent trainer for Fire 'n Ice using the fceux emulator."
+        description="Reinforcement learning agent trainer for Fire 'n Ice using the fceux emulator."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    train_parser = subparsers.add_parser("train", help="Launch PPO training.")
+    train_parser = subparsers.add_parser("train", help="Launch RL training.")
+    train_parser.add_argument(
+        "--algorithm",
+        choices=["dqn", "ppo"],
+        default="dqn",
+        help="Learning algorithm to use (default: dqn).",
+    )
     train_parser.add_argument(
         "--total-timesteps",
         type=int,
@@ -27,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--rollout-steps",
         type=int,
         default=128,
-        help="Number of steps per PPO rollout before an update.",
+        help="Number of steps per PPO rollout before an update (PPO only).",
     )
     train_parser.add_argument(
         "--frame-skip",
@@ -48,14 +55,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="File path to store the trained model (will be created).",
     )
     train_parser.add_argument(
+        "--load-checkpoint",
         "--resume-from",
+        "--init-weights",
+        dest="load_checkpoint",
         type=Path,
-        help="Optional checkpoint path to resume training from.",
+        help=(
+            "Load model parameters from a checkpoint before training. "
+            "Use --load-optimizer to restore optimizer/RNG states when supported."
+        ),
     )
     train_parser.add_argument(
-        "--init-weights",
-        type=Path,
-        help="Optional checkpoint to initialize model weights without optimizer state.",
+        "--load-optimizer",
+        action="store_true",
+        help="Restore optimizer and RNG state when loading a checkpoint (PPO supports this).",
     )
     train_parser.add_argument(
         "--log-dir",
@@ -72,8 +85,82 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--checkpoint-interval",
         type=int,
-        default=25,
-        help="Number of PPO updates between persistent checkpoint snapshots (0 disables).",
+        default=None,
+        help=(
+            "Custom checkpoint cadence override. "
+            "PPO interprets this as updates between checkpoints; DQN uses environment steps."
+        ),
+    )
+    train_parser.add_argument(
+        "--replay-capacity",
+        type=int,
+        default=200_000,
+        help="Maximum number of transitions to keep in the DQN replay buffer.",
+    )
+    train_parser.add_argument(
+        "--learning-starts",
+        type=int,
+        default=20_000,
+        help="Number of steps to collect before starting gradient updates (DQN only).",
+    )
+    train_parser.add_argument(
+        "--dqn-batch-size",
+        type=int,
+        default=64,
+        help="Mini-batch size when sampling from the replay buffer (DQN only).",
+    )
+    train_parser.add_argument(
+        "--dqn-train-frequency",
+        type=int,
+        default=4,
+        help="How often (in environment steps) to run a DQN update.",
+    )
+    train_parser.add_argument(
+        "--dqn-gradient-steps",
+        type=int,
+        default=1,
+        help="Number of gradient steps per DQN update opportunity.",
+    )
+    train_parser.add_argument(
+        "--dqn-target-update",
+        type=int,
+        default=4_000,
+        help="Number of gradient updates between hard target network syncs (DQN only).",
+    )
+    train_parser.add_argument(
+        "--epsilon-start",
+        type=float,
+        default=1.0,
+        help="Initial epsilon value for DQN epsilon-greedy policy.",
+    )
+    train_parser.add_argument(
+        "--epsilon-end",
+        type=float,
+        default=0.05,
+        help="Final epsilon value for DQN epsilon-greedy policy.",
+    )
+    train_parser.add_argument(
+        "--epsilon-decay",
+        type=int,
+        default=500_000,
+        help="Number of steps to linearly decay epsilon between start and end values.",
+    )
+    train_parser.add_argument(
+        "--epsilon-decay-start",
+        type=int,
+        default=0,
+        help="Step count at which to begin decaying epsilon (DQN only).",
+    )
+    train_parser.add_argument(
+        "--dqn-log-interval",
+        type=int,
+        default=5_000,
+        help="Environment steps between metric logs when training with DQN.",
+    )
+    train_parser.add_argument(
+        "--disable-double-dqn",
+        action="store_true",
+        help="Disable Double DQN target action selection.",
     )
     train_parser.add_argument(
         "--speed-mode",
@@ -212,7 +299,7 @@ def run_train(args: argparse.Namespace) -> None:
     fceux_path = args.fceux_path.expanduser()
 
     envs: List[FireIceEnv] = []
-    trainer: Optional[PPOTrainer] = None
+    trainer: Optional[object] = None
     manager: Optional[FCEUXProcessManager] = None
 
     if not args.no_launch_fceux:
@@ -256,26 +343,64 @@ def run_train(args: argparse.Namespace) -> None:
             )
             envs.append(FireIceEnv(config=env_config))
 
-        ppo_config = PPOConfig(
-            total_timesteps=args.total_timesteps,
-            rollout_steps=args.rollout_steps,
-            checkpoint_interval=args.checkpoint_interval,
-            stagnation_update_limit=args.stagnation_update_limit,
-            stagnation_reward_threshold=args.stagnation_reward_threshold,
-            enable_stagnation_resets=not args.disable_stagnation_resets,
-        )
-        trainer = PPOTrainer(
-            envs,
-            config=ppo_config,
-            log_dir=args.log_dir,
-            checkpoint_dir=args.checkpoint_dir,
-        )
+        checkpoint_override = args.checkpoint_interval
+        algorithm = args.algorithm.lower()
 
-        if args.init_weights:
-            trainer.load_weights(str(args.init_weights))
+        if algorithm == "dqn":
+            dqn_config = DQNConfig(
+                total_timesteps=args.total_timesteps,
+                buffer_capacity=args.replay_capacity,
+                batch_size=args.dqn_batch_size,
+                learning_starts=args.learning_starts,
+                train_frequency=args.dqn_train_frequency,
+                gradient_steps=args.dqn_gradient_steps,
+                target_update_interval=args.dqn_target_update,
+                epsilon_start=args.epsilon_start,
+                epsilon_end=args.epsilon_end,
+                epsilon_decay=args.epsilon_decay,
+                epsilon_decay_start=args.epsilon_decay_start,
+                log_interval=args.dqn_log_interval,
+                double_dqn=not args.disable_double_dqn,
+            )
+            checkpoint_interval = (
+                checkpoint_override
+                if checkpoint_override is not None
+                else dqn_config.checkpoint_interval
+            )
+            dqn_config.checkpoint_interval = checkpoint_interval
+            trainer = DQNTrainer(
+                envs,
+                config=dqn_config,
+                log_dir=args.log_dir,
+                checkpoint_dir=args.checkpoint_dir,
+                checkpoint_interval=checkpoint_interval,
+            )
+        elif algorithm == "ppo":
+            ppo_config = PPOConfig(
+                total_timesteps=args.total_timesteps,
+                rollout_steps=args.rollout_steps,
+                stagnation_update_limit=args.stagnation_update_limit,
+                stagnation_reward_threshold=args.stagnation_reward_threshold,
+                enable_stagnation_resets=not args.disable_stagnation_resets,
+            )
+            if checkpoint_override is not None:
+                ppo_config.checkpoint_interval = checkpoint_override
+            trainer = PPOTrainer(
+                envs,
+                config=ppo_config,
+                log_dir=args.log_dir,
+                checkpoint_dir=args.checkpoint_dir,
+                checkpoint_interval=checkpoint_override,
+            )
+        else:
+            raise ValueError(f"Unsupported algorithm: {algorithm}")
 
-        if args.resume_from:
-            trainer.load(str(args.resume_from))
+        if args.load_checkpoint:
+            checkpoint_path = str(args.load_checkpoint)
+            if args.load_optimizer:
+                trainer.load(checkpoint_path)
+            else:
+                trainer.load_weights(checkpoint_path)
 
         trainer.train()
     finally:
@@ -302,8 +427,6 @@ if __name__ == "__main__":
     parsed_args = parser.parse_args()
 
     if parsed_args.command == "train":
-        if getattr(parsed_args, "resume_from", None) and getattr(parsed_args, "init_weights", None):
-            parser.error("Specify only one of --resume-from or --init-weights.")
         run_train(parsed_args)
     else:
         parser.error(f"Unknown command: {parsed_args.command}")

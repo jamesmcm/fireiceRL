@@ -57,3 +57,16 @@ class ActorCritic(nn.Module):
         log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
         return log_probs, entropy, values
+
+
+class QNetwork(nn.Module):
+    """CNN-based Q-value estimator shared by DQN variants."""
+
+    def __init__(self, in_channels: int, num_actions: int, hidden_dim: int = 512) -> None:
+        super().__init__()
+        self.encoder = CNNEncoder(in_channels, hidden_dim)
+        self.q_head = nn.Linear(hidden_dim, num_actions)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        embedding = self.encoder(obs)
+        return self.q_head(embedding)

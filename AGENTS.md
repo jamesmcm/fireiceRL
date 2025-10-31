@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `fireicerl/`: Core Python package. Notable modules include `bridge.py` (ZeroMQ bridge to FCEUX), `environment.py` (Gymnasium wrapper that drives direct level loads), `reward.py` (reward shaping), `launcher.py` (FCEUX process manager), and `ppo.py` (training loop).
+- `fireicerl/`: Core Python package. Notable modules include `bridge.py` (ZeroMQ bridge to FCEUX), `environment.py` (Gymnasium wrapper that drives direct level loads), `reward.py` (reward shaping), `launcher.py` (FCEUX process manager), `dqn.py` (replay-buffer DQN trainer), and `ppo.py` (policy-gradient trainer).
 - `lua/fireice_bridge.lua`: Lua script loaded inside FCEUX to stream frames, RAM, events, and force levels to load directly without visiting menus.
 - `main.py`: CLI entry point for training (`uv run python main.py …`).
 - `logs/`, `checkpoints/`: Created during training for metrics and model snapshots (configurable via CLI).
@@ -12,7 +12,7 @@
 - Install/update dependencies: `uv sync`
 - Lint/format (Python): `uv run ruff check .` (add if linting configured)
 - Byte-compile check: `uv run python -m compileall fireicerl lua/fireice_bridge.lua main.py`
-- Launch training: `uv run python main.py train --help` for options; common flags include `--speed-mode nothrottle`, `--num-workers 26`, `--base-port 6000`, `--log-dir logs/run1`
+- Launch training: `uv run python main.py train --help` for options; common flags include `--speed-mode nothrottle`, `--num-workers 26`, `--base-port 6000`, `--log-dir logs/run1`, `--algorithm {dqn,ppo}`, and `--load-checkpoint`
 - Auto-launch uses `fceux --loadlua lua/fireice_bridge.lua ROM`; add `--no-launch-fceux` if you prefer to bring up emulator sessions yourself.
 - Run Lua bridge manually: `fceux --loadlua lua/fireice_bridge.lua …/Fire\ 'n\ Ice\ (USA).nes`
 

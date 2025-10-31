@@ -1,8 +1,9 @@
-"""Fire 'n Ice PPO training package."""
+"""Fire 'n Ice reinforcement learning package."""
 
 from .bridge import FCEUXBridge, FCEUXConfig
 from .environment import FireIceEnv, FireIceEnvConfig
 from .logging import MetricsLogger
+from .dqn import DQNConfig, DQNTrainer
 from .ppo import PPOConfig, PPOTrainer
 
 __all__ = [
@@ -12,5 +13,7 @@ __all__ = [
     "FireIceEnvConfig",
     "PPOConfig",
     "PPOTrainer",
+    "DQNConfig",
+    "DQNTrainer",
     "MetricsLogger",
 ]

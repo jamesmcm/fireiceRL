@@ -167,6 +167,9 @@ class PPOTrainer:
             else self.config.checkpoint_interval
         )
         self.checkpoint_interval = max(0, int(interval)) if interval else 0
+        self._last_snapshot_update = -1
+        self._last_latest_update = -1
+        self._latest_save_interval = max(1, self.checkpoint_interval or 5)
 
     def train(self) -> None:
         initial_observations = []
@@ -334,8 +337,8 @@ class PPOTrainer:
             )
             update_duration = time.time() - update_start
 
-            reward_mean_per_step = reward_stats.get("total_reward", {}).get(
-                "mean_per_step", 0.0
+            mean_reward_per_step = (
+                total_reward_sum / steps_collected if steps_collected else 0.0
             )
             print(
                 f"Update {update}/{num_updates} "
@@ -344,11 +347,12 @@ class PPOTrainer:
                 f"loss_vf={losses['value_loss']:.4f} "
                 f"entropy={losses['entropy']:.4f} "
                 f"avg_return={avg_return:.2f} "
-                f"mean_reward={reward_mean_per_step:.4f} "
+                f"mean_reward={mean_reward_per_step:.4f} "
                 f"episodes={episodes_completed} "
                 f"curr=W{max(current_worlds, default=0)}-L{max(current_levels, default=0)} "
                 f"furthest=W{max(furthest_worlds, default=0)}-L{max(furthest_levels, default=0)}"
-                + (" [stagnation reset]" if stagnation_reset_triggered else "")
+                + (" [stagnation reset]" if stagnation_reset_triggered else ""),
+                flush=True,
             )
 
             if self.logger:
@@ -368,6 +372,7 @@ class PPOTrainer:
                     "update_duration_s": update_duration,
                     "learning_rate": self.optimizer.param_groups[0]["lr"],
                     "total_reward_sum": total_reward_sum,
+                    "mean_reward_per_step": mean_reward_per_step,
                     "stagnation_reset": int(stagnation_reset_triggered),
                     "elapsed_s": time.time() - self.training_start,
                     "current_world": max(current_worlds, default=0),
@@ -375,23 +380,46 @@ class PPOTrainer:
                     "furthest_world": max(furthest_worlds, default=0),
                     "furthest_level": max(furthest_levels, default=0),
                     "full_game_restart_events": full_restart_events,
+                    "epsilon": 0.0,
+                    "buffer_size": 0,
+                    "td_loss": 0.0,
                 }
                 self.logger.log_update(metrics, reward_stats)
 
-            self._maybe_checkpoint(update, num_updates)
+            self._maybe_checkpoint(update, num_updates, force_latest=True)
 
-    def _maybe_checkpoint(self, update: int, total_updates: int) -> None:
+    def _maybe_checkpoint(
+        self, update: int, total_updates: int, *, force_latest: bool = False, force_snapshot: bool = False
+    ) -> None:
         if not self.checkpoint_dir:
             return
 
-        latest_path = self.checkpoint_dir / "latest.pt"
-        self.save(str(latest_path))
+        should_snapshot = False
+        if force_snapshot:
+            should_snapshot = True
+        elif self.checkpoint_interval and update and update % self.checkpoint_interval == 0:
+            should_snapshot = update != self._last_snapshot_update
+        elif update == total_updates and update != self._last_snapshot_update:
+            should_snapshot = True
 
-        if self.checkpoint_interval and (
-            update % self.checkpoint_interval == 0 or update == total_updates
+        write_latest = False
+        if should_snapshot:
+            write_latest = True
+        elif force_latest and (
+            self._last_latest_update == -1
+            or update - self._last_latest_update >= self._latest_save_interval
         ):
+            write_latest = True
+
+        if write_latest and (should_snapshot or update != self._last_latest_update):
+            latest_path = self.checkpoint_dir / "latest.pt"
+            self.save(str(latest_path))
+            self._last_latest_update = update
+
+        if should_snapshot:
             snapshot_path = self.checkpoint_dir / f"checkpoint_update_{update:05d}.pt"
             self.save(str(snapshot_path))
+            self._last_snapshot_update = update
 
     def save(self, path: str) -> None:
         torch.save(

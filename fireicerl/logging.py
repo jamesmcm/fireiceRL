@@ -8,7 +8,7 @@ from typing import Dict, Optional
 
 
 class MetricsLogger:
-    """Utility for persisting PPO training metrics and reward breakdowns."""
+    """Utility for persisting training metrics and reward breakdowns."""
 
     METRIC_FIELDS = [
         "update",
@@ -19,6 +19,7 @@ class MetricsLogger:
         "policy_loss",
         "value_loss",
         "entropy",
+        "td_loss",
         "avg_return_window",
         "episodes_completed",
         "mean_episode_return",
@@ -33,6 +34,9 @@ class MetricsLogger:
         "furthest_world",
         "furthest_level",
         "full_game_restart_events",
+        "epsilon",
+        "buffer_size",
+        "mean_reward_per_step",
     ]
 
     REWARD_FIELDS = ["update", "global_step", "component", "sum", "count", "mean_per_step", "mean_per_occurrence"]

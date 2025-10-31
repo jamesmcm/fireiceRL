@@ -1,6 +1,6 @@
-## Fire 'n Ice PPO Trainer
+## Fire 'n Ice RL Trainer
 
-Train a Proximal Policy Optimisation (PPO) agent to master *Fire 'n Ice* using an FCEUX emulator bridge, stacked CNN observations, and memory-based reward shaping. The Lua bridge restores a savestate and force-loads the requested world/level on every reset so the agent never has to traverse title or level-select menus.
+Train a Deep Q-Network (DQN) or Proximal Policy Optimisation (PPO) agent to master *Fire 'n Ice* using an FCEUX emulator bridge, stacked CNN observations, and memory-based reward shaping. DQN with an experience replay buffer is now the default algorithm (`--algorithm dqn`), while the previous PPO pipeline remains available via `--algorithm ppo`. The Lua bridge restores a savestate and force-loads the requested world/level on every reset so the agent never has to traverse title or level-select menus.
 
 ![Gameplay Screenshot](screenshot.png)
 
@@ -22,7 +22,8 @@ A more sophisticated reinforcement learning algorithm / world model may be requi
   - `bridge.py` – ZeroMQ REQ client for Lua bridge
   - `environment.py` – Gymnasium wrapper with frame stacking & speed control
   - `reward.py` – shaped rewards (fires, completion, restarts, death; menu signals logged for diagnostics)
-  - `ppo.py` / `logging.py` – training loop, metrics, stagnation resets
+  - `dqn.py` – replay buffer, epsilon-greedy action selection, and DQN training loop with target network syncs
+  - `ppo.py` / `logging.py` – PPO training loop, metrics, stagnation resets
 - `lua/fireice_bridge.lua` – FCEUX-side bridge (frame capture, events, direct level injection)
 - `main.py` – CLI entry point for training/resume
 - `PLAN.md`, `notes.txt` – memory map notes and roadmap
@@ -42,14 +43,27 @@ fceux --loadlua lua/fireice_bridge.lua "roms/Fire 'n Ice (USA).nes"
 Wait for “bound to tcp://*:<port>” in the Lua console, then optionally disable audio/video sync for max speed. Make sure the savestate pointed to by `--save-state-path` (default `roms/1-1-nounlock.sav`) exists; the bridge restores it and rewrites the world/level bytes so training always resumes directly inside a stage.
 
 ### Training the Agent
+The default configuration launches a DQN agent:
 ```bash
- uv run python main.py train \
-   --total-timesteps 8000000 \
-   --rollout-steps 256 \
-   --log-dir logs/run14 \
-   --checkpoint-dir checkpoints/run14 --speed-mode nothrottle \
-   --cnn-snapshot-dir cnn/run14 --cnn-snapshot-interval 256 \
-   --init-weights checkpoints/run13/checkpoint_update_03907.pt
+uv run python main.py train \
+  --total-timesteps 2_000_000 \
+  --replay-capacity 300000 \
+  --dqn-log-interval 10000 \
+  --log-dir logs/dqn-run1 \
+  --checkpoint-dir checkpoints/dqn-run1 \
+  --speed-mode nothrottle
+```
+To warm-start from a previous run, pass `--load-checkpoint path/to/checkpoint.pt`. Include `--load-optimizer` if you also want to restore optimizer and RNG state (supported by PPO; DQN always refreshes its replay buffer on launch).
+
+Switch back to PPO by passing `--algorithm ppo` along with the usual rollout arguments:
+```bash
+uv run python main.py train \
+  --algorithm ppo \
+  --total-timesteps 8_000_000 \
+  --rollout-steps 256 \
+  --log-dir logs/ppo-run14 \
+  --checkpoint-dir checkpoints/ppo-run14 \
+  --speed-mode nothrottle
 ```
 To exploit parallel environments, choose a base port and spawn 26 FCEUX workers (adjust as needed):
 ```bash
@@ -63,13 +77,15 @@ uv run python main.py train \
 ```
 Useful flags:
 - `--speed-mode {normal|turbo|nothrottle}` – mirrors `emu.speedmode`
-- `--checkpoint-interval`, `--checkpoint-dir`, `--log-dir`, `--init-weights`
+- `--checkpoint-interval`, `--checkpoint-dir`, `--log-dir`, `--load-checkpoint`, `--load-optimizer`
+- `--replay-capacity`, `--learning-starts`, `--dqn-batch-size`, `--dqn-train-frequency`, `--dqn-target-update`, `--epsilon-*` – tune DQN replay and exploration behaviour
+- `--num-workers` spawns parallel environments for both DQN (shared replay buffer) and PPO (batched rollouts)
 - `--initial-world`, `--initial-level`, `--save-state-path` – configure which stage the loader injects after every reset (no menu navigation required)
 - `--num-workers`, `--base-port` – control how many emulator sessions are launched and which TCP ports they target (ports increment by one per worker)
 - `--fceux-path`, `--rom-path`, `--lua-script` – override the auto-launch command paths
 - `--no-launch-fceux`, `--fceux-extra-arg` – opt out of auto-launching or append flags (e.g. `--fceux-extra-arg --nogui`)
 
-`metrics.csv` records losses, returns, and `stagnation_reset` events; `reward_components.csv` breaks down components (`fire`, `completion`, `restart`, `death`, `pause`, `menu_entry` — this should stay near zero), etc.
+`metrics.csv` records losses, TD errors (for DQN), returns, and `stagnation_reset` events; `reward_components.csv` breaks down components (`fire`, `completion`, `restart`, `death`, `pause`, `menu_entry` — this should stay near zero), etc.
 
 ### Reward & Event Signals
 - Fires remaining `$00AB` (positive on decrease, bonus at zero)
