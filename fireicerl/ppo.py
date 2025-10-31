@@ -169,6 +169,11 @@ class PPOTrainer:
             update_episode_returns: list[float] = []
             update_episode_lengths: list[int] = []
             current_episode_length = self._ongoing_episode_length
+            furthest_world = 0
+            furthest_level = 0
+            current_world = 0
+            current_level = 0
+            full_restart_events = 0
 
             for _ in range(rollout_steps):
                 with torch.no_grad():
@@ -189,6 +194,27 @@ class PPOTrainer:
                 for key, value in reward_components.items():
                     reward_sums[key] += float(value)
                     reward_counts[key] += 1
+
+                world = info.get("current_world") or info.get("world")
+                level = info.get("current_level") or info.get("level")
+                if world is not None:
+                    current_world = int(world)
+                    if level is not None:
+                        current_level = int(level)
+
+                furthest_world_info = info.get("furthest_world")
+                furthest_level_info = info.get("furthest_level")
+                if furthest_world_info is not None:
+                    f_world = int(furthest_world_info)
+                    f_level = int(furthest_level_info or 0)
+                    if f_world > furthest_world or (
+                        f_world == furthest_world and f_level > furthest_level
+                    ):
+                        furthest_world = f_world
+                        furthest_level = f_level
+
+                if info.get("full_game_restart"):
+                    full_restart_events += 1
 
                 buffer.add(
                     obs_tensor.squeeze(0),
@@ -283,7 +309,9 @@ class PPOTrainer:
                 f"entropy={losses['entropy']:.4f} "
                 f"avg_return={avg_return:.2f} "
                 f"mean_reward={reward_mean_per_step:.4f} "
-                f"episodes={episodes_completed}"
+                f"episodes={episodes_completed} "
+                f"curr=W{current_world}-L{current_level} "
+                f"furthest=W{furthest_world}-L{furthest_level}"
                 + (" [stagnation reset]" if stagnation_reset_triggered else "")
             )
 
@@ -306,6 +334,11 @@ class PPOTrainer:
                     "total_reward_sum": total_reward_sum,
                     "stagnation_reset": int(stagnation_reset_triggered),
                     "elapsed_s": time.time() - self.training_start,
+                    "current_world": current_world,
+                    "current_level": current_level,
+                    "furthest_world": furthest_world,
+                    "furthest_level": furthest_level,
+                    "full_game_restart_events": full_restart_events,
                 }
                 self.logger.log_update(metrics, reward_stats)
 
@@ -338,18 +371,29 @@ class PPOTrainer:
         )
 
     def load(self, path: str) -> None:
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
         self.global_step = int(checkpoint.get("global_step", self.global_step))
 
         torch_rng = checkpoint.get("torch_rng_state")
         if torch_rng is not None:
+            if not isinstance(torch_rng, torch.ByteTensor):
+                torch_rng = torch.tensor(torch_rng, dtype=torch.uint8)
             torch.set_rng_state(torch_rng)
 
         numpy_rng = checkpoint.get("numpy_rng_state")
         if numpy_rng is not None:
+            if isinstance(numpy_rng, list):
+                numpy_rng = tuple(numpy_rng)
             np.random.set_state(numpy_rng)
+
+    def load_weights(self, path: str) -> None:
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        state_dict = checkpoint.get("model_state") if isinstance(checkpoint, dict) else None
+        if state_dict is None:
+            state_dict = checkpoint
+        self.model.load_state_dict(state_dict)
 
     def close(self) -> None:
         if self.logger:

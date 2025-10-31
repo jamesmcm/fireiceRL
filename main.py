@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--frame-skip",
         type=int,
-        default=4,
+        default=1,
         help="Number of emulator frames to advance per environment step.",
     )
     train_parser.add_argument(
@@ -48,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume-from",
         type=Path,
         help="Optional checkpoint path to resume training from.",
+    )
+    train_parser.add_argument(
+        "--init-weights",
+        type=Path,
+        help="Optional checkpoint to initialize model weights without optimizer state.",
     )
     train_parser.add_argument(
         "--log-dir",
@@ -70,18 +75,61 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--speed-mode",
         choices=["normal", "turbo", "nothrottle"],
-        default="normal",
+        default="turbo",
         help="Emulator speed setting applied via the Lua bridge (normal, turbo, nothrottle).",
     )
     train_parser.add_argument(
-        "--reset-on-level-complete",
-        action="store_true",
-        help="End an episode whenever a level is completed (default: disabled).",
+        "--initial-world",
+        type=int,
+        default=1,
+        help="World number to start training from (1-indexed).",
     )
     train_parser.add_argument(
-        "--reset-on-death",
-        action="store_true",
-        help="End an episode whenever the agent dies (default: disabled).",
+        "--initial-level",
+        type=int,
+        default=1,
+        help="Level number within the world to start from (1-indexed).",
+    )
+    train_parser.add_argument(
+        "--levels-per-world",
+        type=int,
+        default=10,
+        help="Number of levels in each world (used for linear progression).",
+    )
+    train_parser.add_argument(
+        "--max-world",
+        type=int,
+        default=8,
+        help="Highest world index to attempt before clamping progression.",
+    )
+    train_parser.add_argument(
+        "--save-state-path",
+        type=Path,
+        default=Path("roms/1-1-nounlock.sav"),
+        help="Savestate used for environment resets and level restarts.",
+    )
+    train_parser.add_argument(
+        "--cnn-snapshot-dir",
+        type=Path,
+        help="Optional directory to dump CNN input observations periodically.",
+    )
+    train_parser.add_argument(
+        "--cnn-snapshot-interval",
+        type=int,
+        default=0,
+        help="Frequency (in environment steps) to save CNN inputs when enabled (0 disables).",
+    )
+    train_parser.add_argument(
+        "--stagnation-no-positive-limit",
+        type=int,
+        default=50,
+        help="Episodes without positive reward before forcing a full game restart.",
+    )
+    train_parser.add_argument(
+        "--stagnation-no-completion-limit",
+        type=int,
+        default=500,
+        help="Episodes without a level completion before forcing a full game restart.",
     )
     train_parser.add_argument(
         "--stagnation-update-limit",
@@ -109,8 +157,15 @@ def run_train(args: argparse.Namespace) -> None:
         frame_skip=args.frame_skip,
         stack_size=args.stack_size,
         speed_mode=args.speed_mode,
-        reset_on_level_complete=args.reset_on_level_complete,
-        reset_on_death=args.reset_on_death,
+        initial_world=args.initial_world,
+        initial_level=args.initial_level,
+        levels_per_world=args.levels_per_world,
+        max_world=args.max_world,
+        save_state_path=str(args.save_state_path),
+        cnn_snapshot_dir=str(args.cnn_snapshot_dir) if args.cnn_snapshot_dir else None,
+        cnn_snapshot_interval=args.cnn_snapshot_interval,
+        stagnation_no_positive_limit=args.stagnation_no_positive_limit,
+        stagnation_no_completion_limit=args.stagnation_no_completion_limit,
     )
     env = FireIceEnv(config=env_config)
     ppo_config = PPOConfig(
@@ -127,6 +182,9 @@ def run_train(args: argparse.Namespace) -> None:
         log_dir=args.log_dir,
         checkpoint_dir=args.checkpoint_dir,
     )
+
+    if args.init_weights:
+        trainer.load_weights(str(args.init_weights))
 
     if args.resume_from:
         trainer.load(str(args.resume_from))
@@ -153,6 +211,8 @@ if __name__ == "__main__":
     parsed_args = parser.parse_args()
 
     if parsed_args.command == "train":
+        if getattr(parsed_args, "resume_from", None) and getattr(parsed_args, "init_weights", None):
+            parser.error("Specify only one of --resume-from or --init-weights.")
         run_train(parsed_args)
     else:
         parser.error(f"Unknown command: {parsed_args.command}")

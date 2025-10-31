@@ -13,3 +13,6 @@ logs/
 checkpoints/
 *.lock
 
+
+roms/
+cnn/

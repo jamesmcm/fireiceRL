@@ -72,10 +72,41 @@ class FCEUXBridge:
             f"{self.config.handshake_retries} attempts."
         )
 
-    def reset(self) -> Dict:
+    def reset(
+        self,
+        *,
+        world: Optional[int] = None,
+        level: Optional[int] = None,
+        save_state: Optional[str] = None,
+    ) -> Dict:
         """Ask the emulator to reset the environment and return the initial observation payload."""
         self.handshake()
-        return self._request({"cmd": "reset"})
+        payload: Dict[str, object] = {"cmd": "reset"}
+        if world is not None:
+            payload["world"] = int(world)
+        if level is not None:
+            payload["level"] = int(level)
+        if save_state is not None:
+            payload["save_state"] = save_state
+        return self._request(payload)
+
+    def restart_level(
+        self,
+        *,
+        world: Optional[int] = None,
+        level: Optional[int] = None,
+        save_state: Optional[str] = None,
+    ) -> Dict:
+        """Force the current level to restart from a clean savestate."""
+        self.handshake()
+        payload: Dict[str, object] = {"cmd": "restart_level"}
+        if world is not None:
+            payload["world"] = int(world)
+        if level is not None:
+            payload["level"] = int(level)
+        if save_state is not None:
+            payload["save_state"] = save_state
+        return self._request(payload)
 
     def step(self, action: str, options: Optional[Dict[str, object]] = None) -> Dict:
         """Send an action identifier to the emulator and return the resulting payload."""
@@ -94,6 +125,11 @@ class FCEUXBridge:
         """Configure the emulator speed (e.g. normal, turbo, nothrottle)."""
         self.handshake()
         return self._request({"cmd": "set_speed", "mode": mode})
+
+    def set_frame_skip(self, skip: int) -> Dict:
+        """Configure how many emulator frames to advance per environment step."""
+        self.handshake()
+        return self._request({"cmd": "set_frame_skip", "skip": int(skip)})
 
     def _request(self, payload: Dict) -> Dict:
         if self._socket is None:

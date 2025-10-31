@@ -24,6 +24,37 @@ end
 
 augment_package_paths()
 
+local function normalize_path(path)
+  return (path or ""):gsub("\\", "/")
+end
+
+local SCRIPT_SOURCE = debug.getinfo(1, "S").source or ""
+local SCRIPT_DIR = normalize_path(SCRIPT_SOURCE):match("@(.*/)") or "./"
+if SCRIPT_DIR:sub(-1) ~= "/" then
+  SCRIPT_DIR = SCRIPT_DIR .. "/"
+end
+
+local PROJECT_ROOT = SCRIPT_DIR:match("^(.*)/lua/?$") or SCRIPT_DIR
+if PROJECT_ROOT:sub(-1) ~= "/" then
+  PROJECT_ROOT = PROJECT_ROOT .. "/"
+end
+
+local function is_absolute_path(path)
+  path = normalize_path(path)
+  return path:sub(1, 1) == "/" or path:match("^%a:/")
+end
+
+local function resolve_project_path(path)
+  if not path or path == "" then
+    return nil
+  end
+  path = normalize_path(path)
+  if is_absolute_path(path) then
+    return path
+  end
+  return PROJECT_ROOT .. path
+end
+
 local function require_zmq()
   local candidates = { "zmq", "zmq.core", "lzmq" }
   for _, name in ipairs(candidates) do
@@ -115,8 +146,14 @@ print("[fireice] bound to tcp://*:5555")
 
 local FRAME_WIDTH = 256
 local FRAME_HEIGHT = 240
+local DEFAULT_SAVE_STATE = resolve_project_path("roms/1-1-nounlock.sav")
+local LEVEL_LOAD_TIMEOUT_FRAMES = 300
+local POST_LOAD_IDLE_FRAMES = 20
+local STATE_SETTLE_FRAMES = 30
+local FRAME_SKIP = 1
 
 local BUTTON_MAP = {
+  NOOP = nil,
   LEFT = { left = true },
   RIGHT = { right = true },
   A = { A = true },
@@ -131,6 +168,7 @@ local MONITORED_ADDRS = {
   0x00AB,
   0x00B5,
   0x00D4,
+  0x00B4,
   0x06A9,
   0x0324,
   0x0328,
@@ -201,6 +239,102 @@ end
 
 local last_in_level = false
 local last_death_flag = false
+local last_world_index = 0
+local last_level_index = 0
+local furthest_world_index = 0
+local furthest_level_index = 0
+
+local function wait_frames(count)
+  for _ = 1, count do
+    emu.frameadvance()
+  end
+end
+
+local function wait_until(predicate, timeout_frames)
+  local frames = timeout_frames or LEVEL_LOAD_TIMEOUT_FRAMES
+  for _ = 1, frames do
+    if predicate() then
+      return true
+    end
+    emu.frameadvance()
+  end
+  return false
+end
+
+local function load_saved_state(path)
+  local target = resolve_project_path(path) or DEFAULT_SAVE_STATE
+  if not target then
+    return false, "no savestate path configured"
+  end
+
+  local probe = io.open(target, "rb")
+  if not probe then
+    return false, string.format("savestate not found: %s", target)
+  end
+  probe:close()
+
+  local ok, err = pcall(function()
+    local state = savestate.create(target)
+    savestate.load(state)
+  end)
+  if not ok then
+    return false, err or "failed to load savestate"
+  end
+  wait_frames(STATE_SETTLE_FRAMES)
+  return true
+end
+
+local function set_game_level(world_num, level_num)
+  -- Lua save state always loads into an active level; rewrite level selection memory to jump.
+  local world_idx = math.max(0, (world_num or 1) - 1)
+  local level_idx = math.max(0, (level_num or 1) - 1)
+  memory.writebyte(0x00B4, 10 * world_idx + level_idx)
+  memory.writebyte(0x0002, 0x06)
+end
+
+local function is_level_ready()
+  local game_state = memory.readbyte(0x0002) or 0
+  local stage_id = memory.readbyte(0x00B4) or 0xFF
+  return game_state >= 0x06 and stage_id ~= 0xFF
+end
+
+local function restart_level(world_num, level_num, opts)
+  local options = opts or {}
+  local save_path = options.save_path or DEFAULT_SAVE_STATE
+
+  local loaded, err = load_saved_state(save_path)
+  if not loaded then
+    return false, ("savestate load failed: %s"):format(tostring(err))
+  end
+
+  local level_ready = wait_until(function()
+    return is_level_ready()
+  end)
+
+  if not level_ready then
+    return false, "timeout waiting for level after savestate load"
+  end
+
+  set_game_level(world_num, level_num)
+
+  local success = wait_until(function()
+    if is_level_ready() then
+      return true
+    end
+    local ram = read_ram_snapshot()
+    return is_in_level(ram)
+  end)
+
+  if not success then
+    return false, "timeout waiting for level load after jump"
+  end
+
+  wait_frames(POST_LOAD_IDLE_FRAMES)
+
+  last_in_level = true
+  last_death_flag = false
+  return true
+end
 
 local function build_payload()
   local ram_snapshot = read_ram_snapshot()
@@ -217,7 +351,21 @@ local function build_payload()
     in_level = in_level,
     level_select = on_level_select,
     paused = paused,
+    world_index = ram_snapshot["0x00D4"] or last_world_index,
+    level_index = ram_snapshot["0x00B5"] or last_level_index,
   }
+
+  last_world_index = info.world_index or last_world_index
+  last_level_index = info.level_index or last_level_index
+
+  if in_level then
+    if last_world_index > furthest_world_index then
+      furthest_world_index = last_world_index
+      furthest_level_index = last_level_index
+    elseif last_world_index == furthest_world_index and last_level_index > furthest_level_index then
+      furthest_level_index = last_level_index
+    end
+  end
 
   local payload = {
     status = "ok",
@@ -229,6 +377,8 @@ local function build_payload()
 
   info.level_completed_event = false
   info.death_event = false
+  info.furthest_world_index = furthest_world_index
+  info.furthest_level_index = furthest_level_index
 
   if last_in_level and not in_level and on_level_select and level_complete_flag == 0 then
     info.level_completed_event = true
@@ -244,27 +394,26 @@ local function build_payload()
 end
 
 local function soft_reset()
-  emu.softreset()
-  for _ = 1, 15 do
-    emu.frameadvance()
-  end
   last_in_level = false
   last_death_flag = false
 end
 
-local function apply_action(action_name)
-  local button_state = BUTTON_MAP[action_name] or {}
-  joypad.set(1, button_state)
-  emu.frameadvance()
-  joypad.set(1, {}) -- release buttons
-end
-
 local function step(action_name)
-  if action_name then
-    apply_action(action_name)
-  else
+  local frames_to_run = math.max(1, math.floor(FRAME_SKIP))
+  local button_state = BUTTON_MAP[action_name]
+
+  if button_state then
+    joypad.set(1, button_state)
+  end
+
+  for _ = 1, frames_to_run do
     emu.frameadvance()
   end
+
+  if button_state then
+    joypad.set(1, {})
+  end
+
   return build_payload()
 end
 
@@ -279,7 +428,26 @@ local function handle_request(request)
     }
   elseif cmd == "reset" then
     soft_reset()
+    local target_world = request.world or (last_world_index + 1)
+    local target_level = request.level or (last_level_index + 1)
+    local ok, err = restart_level(target_world, target_level, { save_path = request.save_state })
+    if not ok then
+      return { status = "error", message = err }
+    end
     return build_payload()
+  elseif cmd == "restart_level" then
+    local target_world = request.world or (last_world_index + 1)
+    local target_level = request.level or (last_level_index + 1)
+    local ok, err = restart_level(target_world, target_level, { save_path = request.save_state })
+    if not ok then
+      return { status = "error", message = err }
+    end
+    local payload = build_payload()
+    payload.info = payload.info or {}
+    payload.info.level_restart_event = true
+    payload.terminated = true
+    payload.done = true
+    return payload
   elseif cmd == "set_speed" then
     local mode = request.mode or "normal"
     if type(mode) == "string" then
@@ -288,21 +456,25 @@ local function handle_request(request)
     else
       return { status = "error", message = "invalid speed mode" }
     end
+  elseif cmd == "set_frame_skip" then
+    local skip = tonumber(request.skip)
+    if not skip or skip < 1 then
+      return { status = "error", message = "frame skip must be >= 1" }
+    end
+    FRAME_SKIP = math.max(1, math.floor(skip))
+    return { status = "ok", frame_skip = FRAME_SKIP }
   elseif cmd == "step" then
-    local payload = step(request.action)
+    local action = request.action
+    if action == "LEVELRESTART" then
+      -- Treat as a no-op here; environment should explicitly call restart_level command.
+      action = nil
+    end
+    local payload = step(action)
     local info = payload.info or {}
-    local reset_on_complete = request.reset_on_level_complete
-    local reset_on_death = request.reset_on_death
-
-    if info.level_completed_event and reset_on_complete then
-      payload.done = true
-      payload.terminated = true
-    end
-
-    if info.death_event and reset_on_death then
-      payload.done = true
-      payload.terminated = true
-    end
+    local level_completed = info.level_completed_event
+    local death_happened = info.death_event or ((payload.ram or {})["0x0003"] == 8)
+    payload.terminated = level_completed or death_happened
+    payload.done = payload.terminated
 
     return payload
   elseif cmd == "pause" then

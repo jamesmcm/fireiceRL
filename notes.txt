@@ -9,7 +9,9 @@ Need to reward being in game in an uncompleted level (small initial reward?)
 
 
 How to track number of completed levels? -  $00B5 is level - 1, e.g. 9 for world 1 castle
-$00D4 is world number -1  - when in level
+$00B6 is world number -1  - when in level
+But both of those set by writing 10*(world number -1) + level number to $00B4
+$00D4 is colour palette (set to world index for that world's colours)
 e.g. final stage 10-10 world 10 castle has $00B5 (level-1 within world) = 9, and $00D4=9 (world-1)
 $0400 is bitmask world 1 1-8 (0-255)
 1 1-9 completion sets $0401 to 65 , castle completion sets $0401 to 195

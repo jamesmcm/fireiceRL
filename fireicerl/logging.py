@@ -28,6 +28,11 @@ class MetricsLogger:
         "learning_rate",
         "stagnation_reset",
         "elapsed_s",
+        "current_world",
+        "current_level",
+        "furthest_world",
+        "furthest_level",
+        "full_game_restart_events",
     ]
 
     REWARD_FIELDS = ["update", "global_step", "component", "sum", "count", "mean_per_step", "mean_per_occurrence"]
