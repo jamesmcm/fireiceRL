@@ -32,11 +32,14 @@ A more sophisticated reinforcement learning algorithm / world model may be requi
 ```bash
 uv sync  # install Python deps
 
-fceux "/path/to/Fire 'n Ice (USA).nes" \
-  --loadlua lua/fireice_bridge.lua
+# The trainer now spawns FCEUX workers automatically.
+# Provide explicit paths if the defaults do not match your system.
 ```
-Wait for “bound to tcp://*:5555” in the Lua console, then optionally disable audio/video sync for max speed.
-Make sure the savestate pointed to by `--save-state-path` (default `roms/1-1-nounlock.sav`) exists; the bridge restores it and rewrites the world/level bytes so training always resumes directly inside a stage.
+The training CLI launches each emulator with the Lua bridge attached. Supply `--fceux-path`, `--rom-path`, and `--lua-script` if they differ from the defaults. To manage FCEUX manually, run the usual command and add `--no-launch-fceux` when starting training:
+```bash
+fceux --loadlua lua/fireice_bridge.lua "roms/Fire 'n Ice (USA).nes"
+```
+Wait for “bound to tcp://*:<port>” in the Lua console, then optionally disable audio/video sync for max speed. Make sure the savestate pointed to by `--save-state-path` (default `roms/1-1-nounlock.sav`) exists; the bridge restores it and rewrites the world/level bytes so training always resumes directly inside a stage.
 
 ### Training the Agent
 ```bash
@@ -48,10 +51,23 @@ Make sure the savestate pointed to by `--save-state-path` (default `roms/1-1-nou
    --cnn-snapshot-dir cnn/run14 --cnn-snapshot-interval 256 \
    --init-weights checkpoints/run13/checkpoint_update_03907.pt
 ```
+To exploit parallel environments, choose a base port and spawn 26 FCEUX workers (adjust as needed):
+```bash
+uv run python main.py train \
+  --num-workers 26 \
+  --base-port 6000 \
+  --fceux-path /usr/bin/fceux \
+  --rom-path "roms/Fire 'n Ice (USA).nes" \
+  --lua-script lua/fireice_bridge.lua \
+  --total-timesteps 12000000
+```
 Useful flags:
 - `--speed-mode {normal|turbo|nothrottle}` – mirrors `emu.speedmode`
 - `--checkpoint-interval`, `--checkpoint-dir`, `--log-dir`, `--init-weights`
 - `--initial-world`, `--initial-level`, `--save-state-path` – configure which stage the loader injects after every reset (no menu navigation required)
+- `--num-workers`, `--base-port` – control how many emulator sessions are launched and which TCP ports they target (ports increment by one per worker)
+- `--fceux-path`, `--rom-path`, `--lua-script` – override the auto-launch command paths
+- `--no-launch-fceux`, `--fceux-extra-arg` – opt out of auto-launching or append flags (e.g. `--fceux-extra-arg --nogui`)
 
 `metrics.csv` records losses, returns, and `stagnation_reset` events; `reward_components.csv` breaks down components (`fire`, `completion`, `restart`, `death`, `pause`, `menu_entry` — this should stay near zero), etc.
 
@@ -71,7 +87,7 @@ Tune magnitudes in `fireicerl/reward.py` as needed; metrics automatically export
 
 ### Tips & Troubleshooting
 - `--nogui` disables Lua so cannot be used for headless runs here.
-- Ensure TCP port `5555` is free before launching; restart FCEUX if the bridge fails to bind.
+- Ensure the entire port range `base_port ... base_port + num_workers - 1` is free before launching; restart any failed worker if the bridge cannot bind.
 - If you ever land on the title or level-select screen during training, double-check the savestate path and loader configuration—menus should never appear under normal operation.
 - For speed, combine `--speed-mode nothrottle`, disabled sync in FCEUX, and higher `--frame-skip`.
 - If reward totals stay positive after finishing a level, confirm `reward_components.csv` shows only one `completion` entry—otherwise the level may not have exited properly.
@@ -84,4 +100,3 @@ Tune magnitudes in `fireicerl/reward.py` as needed; metrics automatically export
   still run Lua? Can we still read the VRAM in this case?
 - Is there a faster emulator where we can directly send input and read
   VRAM without the Lua bridge?
-- How can we make this easy to run in parallel?

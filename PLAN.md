@@ -29,6 +29,7 @@ A custom Lua script will be the heart of the emulator-side interaction. This scr
 *   **Controller Input:** Receive commands from the Python agent and translate them into on-level controller inputs (left, right, A); menu buttons are no longer required because resets skip straight into gameplay.
 *   **Level Injection:** Handle `reset`/`restart_level` commands from Python by restoring a clean savestate and force-writing the requested world/level so the agent spawns directly in the stage.
 *   **Communication:** Send the collected game state information (VRAM and RAM values) to the Python script and receive actions in return, likely using ZeroMQ sockets.
+*   **Port Coordination:** Read `FIREICE_PORT` (and optional fallback settings) from the environment so multiple Lua bridges can bind to distinct TCP ports without clashing.
 
 ### Step 2: Crafting the Brain - The PPO Agent
 
@@ -91,6 +92,10 @@ The main training loop will orchestrate the interaction between the agent and th
 9.  **PPO Update:** Periodically, the agent will use the collected data to update its policy and value networks using the PPO algorithm.
 10. **Repeat:** This process will repeat for thousands or even millions of frames, allowing the agent to gradually learn and improve its gameplay.
 
+#### Parallel Environment Batching
+
+To accelerate data collection, the trainer can drive multiple FCEUX instances concurrently (`--num-workers`). Observations, actions, value targets, and advantages are batched across workers each rollout step. Episodes terminate independently: when a worker reports `done`, the trainer records its terminal statistics, immediately issues an environment reset on that worker, and continues populating the batch with the fresh observation. Reward accounting and stagnation logic aggregate totals across all workers, while CNN snapshots write into per-worker subdirectories to avoid filename clashes.
+
 ### Step 5: Action Space and Menu Handling
 
 **5.1. Core Actions:**
@@ -116,5 +121,6 @@ By following these steps and leveraging the provided memory addresses, you can s
 * Lua-side communication relies on the actively maintained `lua-zmq` bindings (falling back to `lzmq` when present). The bridge now polls the socket without blocking the emulator.
 * The bridge exposes a `set_speed` command so training runs can switch FCEUX into `normal`, `turbo`, or `nothrottle` speed modes directly from the Python shell.
 * Python uses Gymnasium-style wrappers, stacked grayscale observations, and a PPO agent with regular logging (`metrics.csv`, `reward_components.csv`, `events.jsonl`) and periodic checkpoints.
+* A lightweight launcher spawns N FCEUX processes with consecutive ports (`--base-port`), exports `FIREICE_PORT` for each worker, and cleans them up when training stops.
 * Episode termination in the bridge is configurable: the agent can continue play after level clears/deaths or trigger resets via CLI flags. Detection relies on the in-level flags (`$0018/$001C/$00D0`), level-select flags (`$0324/$0328`), pause flags (`$031D/$0321`), and the death animation flag (`$0003 == 8`).
 * The PPO trainer can optionally trigger full environment resets after a configurable number of updates without positive reward, preventing the agent from stalling on unsolved levels.

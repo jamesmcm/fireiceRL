@@ -133,16 +133,77 @@ local ZMQ_REP = zmq.REP or zmq.REP_SOCKET or 4
 local responder, sock_err = create_socket(context, ZMQ_REP)
 assert(responder, sock_err)
 
-local bind_ok, bind_err
-if type(responder.bind) == "function" then
-  bind_ok, bind_err = responder:bind("tcp://*:5555")
-elseif zmq.bind then
-  bind_ok, bind_err = zmq.bind(responder, "tcp://*:5555")
-else
-  error("ZeroMQ binding cannot bind sockets via known APIs.")
+local function pick_port_candidates()
+  local env_port = tonumber(os.getenv("FIREICE_PORT") or "")
+  local base = env_port or 5555
+  local attempts = tonumber(os.getenv("FIREICE_PORT_ATTEMPTS") or "") or 20
+  local step = tonumber(os.getenv("FIREICE_PORT_STEP") or "") or 1
+  if attempts < 1 then
+    attempts = 1
+  end
+  local ports = {}
+  for i = 0, attempts - 1 do
+    table.insert(ports, base + i * step)
+  end
+  if not env_port then
+    table.insert(ports, 0)
+  end
+  return ports
 end
-assert(bind_ok, bind_err)
-print("[fireice] bound to tcp://*:5555")
+
+local ACTIVE_PORT = nil
+
+local function try_bind_port(port)
+  local endpoint
+  if port and port > 0 then
+    endpoint = string.format("tcp://*:%d", port)
+  else
+    endpoint = "tcp://*:*"
+  end
+
+  local ok, err
+  if type(responder.bind) == "function" then
+    ok, err = responder:bind(endpoint)
+  elseif zmq.bind then
+    ok, err = zmq.bind(responder, endpoint)
+  else
+    error("ZeroMQ binding cannot bind sockets via known APIs.")
+  end
+
+  if ok then
+    if endpoint:sub(-2) == ":*" and responder.getsockopt and zmq.LAST_ENDPOINT then
+      local ok_last, last_or_err = pcall(function()
+        return responder:getsockopt(zmq.LAST_ENDPOINT)
+      end)
+      if ok_last and last_or_err then
+        local extracted = tostring(last_or_err):match(":%d+$")
+        if extracted then
+          port = tonumber(extracted:sub(2))
+        end
+      elseif not ok_last then
+        print(string.format("[fireice] warning: failed to read dynamic bind endpoint: %s", tostring(last_or_err)))
+      end
+    end
+    return true, port
+  end
+
+  return false, err
+end
+
+local bind_success = false
+for _, port in ipairs(pick_port_candidates()) do
+  local ok, result = try_bind_port(port)
+  if ok then
+    ACTIVE_PORT = result
+    bind_success = true
+    break
+  else
+    print(string.format("[fireice] failed to bind on port candidate %s: %s", tostring(port), tostring(result)))
+  end
+end
+
+assert(bind_success, "ZeroMQ bridge failed to bind to any requested port.")
+print(string.format("[fireice] bound to tcp://*:%d", ACTIVE_PORT or -1))
 
 local FRAME_WIDTH = 256
 local FRAME_HEIGHT = 240
@@ -425,6 +486,7 @@ local function handle_request(request)
       status = "ok",
       server = "fceux-fireice",
       version = "0.1.0",
+      port = ACTIVE_PORT,
     }
   elseif cmd == "reset" then
     soft_reset()

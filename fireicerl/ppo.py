@@ -5,7 +5,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -42,42 +42,51 @@ class PPOConfig:
 class RolloutBuffer:
     """Stores trajectories for PPO updates."""
 
-    def __init__(self, buffer_size: int, obs_shape: Tuple[int, ...], device: str) -> None:
+    def __init__(
+        self,
+        num_steps: int,
+        num_envs: int,
+        obs_shape: Tuple[int, ...],
+        device: str,
+    ) -> None:
         self.device = torch.device(device)
-        self.buffer_size = buffer_size
-        self.obs = torch.zeros((buffer_size, *obs_shape), dtype=torch.float32, device=self.device)
-        self.actions = torch.zeros(buffer_size, dtype=torch.long, device=self.device)
-        self.log_probs = torch.zeros(buffer_size, dtype=torch.float32, device=self.device)
-        self.rewards = torch.zeros(buffer_size, dtype=torch.float32, device=self.device)
-        self.values = torch.zeros(buffer_size, dtype=torch.float32, device=self.device)
-        self.dones = torch.zeros(buffer_size, dtype=torch.float32, device=self.device)
-        self.advantages = torch.zeros(buffer_size, dtype=torch.float32, device=self.device)
-        self.returns = torch.zeros(buffer_size, dtype=torch.float32, device=self.device)
+        self.num_steps = num_steps
+        self.num_envs = num_envs
+        self.obs = torch.zeros(
+            (num_steps, num_envs, *obs_shape), dtype=torch.float32, device=self.device
+        )
+        self.actions = torch.zeros((num_steps, num_envs), dtype=torch.long, device=self.device)
+        self.log_probs = torch.zeros((num_steps, num_envs), dtype=torch.float32, device=self.device)
+        self.rewards = torch.zeros((num_steps, num_envs), dtype=torch.float32, device=self.device)
+        self.values = torch.zeros((num_steps, num_envs), dtype=torch.float32, device=self.device)
+        self.dones = torch.zeros((num_steps, num_envs), dtype=torch.float32, device=self.device)
+        self.advantages = torch.zeros((num_steps, num_envs), dtype=torch.float32, device=self.device)
+        self.returns = torch.zeros((num_steps, num_envs), dtype=torch.float32, device=self.device)
         self.pos = 0
 
     def add(
         self,
         obs: torch.Tensor,
-        action: torch.Tensor,
-        log_prob: torch.Tensor,
-        reward: float,
-        value: torch.Tensor,
-        done: bool,
+        actions: torch.Tensor,
+        log_probs: torch.Tensor,
+        rewards: torch.Tensor,
+        values: torch.Tensor,
+        dones: torch.Tensor,
     ) -> None:
         self.obs[self.pos].copy_(obs)
-        self.actions[self.pos] = action
-        self.log_probs[self.pos] = log_prob
-        self.rewards[self.pos] = reward
-        self.values[self.pos] = value
-        self.dones[self.pos] = float(done)
-        self.pos = (self.pos + 1) % self.buffer_size
+        self.actions[self.pos].copy_(actions)
+        self.log_probs[self.pos].copy_(log_probs)
+        self.rewards[self.pos].copy_(rewards)
+        self.values[self.pos].copy_(values)
+        self.dones[self.pos].copy_(dones)
+        self.pos = (self.pos + 1) % self.num_steps
 
     def compute_returns_and_advantages(
         self, last_value: torch.Tensor, last_done: torch.Tensor, config: PPOConfig
     ) -> None:
-        last_gae = 0.0
-        for step in reversed(range(self.buffer_size)):
-            if step == self.buffer_size - 1:
+        last_gae = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        for step in reversed(range(self.num_steps)):
+            if step == self.num_steps - 1:
                 next_value = last_value
                 next_done = last_done
             else:
@@ -97,8 +106,9 @@ class RolloutBuffer:
         self.returns = self.advantages + self.values
 
     def get_batches(self, batch_size: int):
-        indices = torch.randperm(self.buffer_size, device=self.device)
-        for start in range(0, self.buffer_size, batch_size):
+        total_samples = self.num_steps * self.num_envs
+        indices = torch.randperm(total_samples, device=self.device)
+        for start in range(0, total_samples, batch_size):
             yield indices[start : start + batch_size]
 
 
@@ -107,17 +117,26 @@ class PPOTrainer:
 
     def __init__(
         self,
-        env: FireIceEnv,
+        envs: Sequence[FireIceEnv] | FireIceEnv,
         config: Optional[PPOConfig] = None,
         *,
         log_dir: Optional[str | Path] = None,
         checkpoint_dir: Optional[str | Path] = None,
         checkpoint_interval: Optional[int] = None,
     ) -> None:
-        self.env = env
+        if isinstance(envs, FireIceEnv):
+            self.envs = [envs]
+        else:
+            self.envs = list(envs)
+        if not self.envs:
+            raise ValueError("At least one environment must be provided to PPOTrainer.")
+
         self.config = config or PPOConfig()
-        obs_shape = env.observation_space.shape
-        self.num_actions = env.action_space.n
+        self.num_envs = len(self.envs)
+        first_env = self.envs[0]
+        obs_shape = first_env.observation_space.shape
+        self.obs_shape = obs_shape
+        self.num_actions = first_env.action_space.n
         self.device = torch.device(self.config.device)
 
         in_channels = obs_shape[0]
@@ -126,7 +145,7 @@ class PPOTrainer:
 
         self.global_step = 0
         self.episode_returns = []
-        self._ongoing_episode_length = 0
+        self._ongoing_episode_lengths = [0 for _ in range(self.num_envs)]
         self.training_start = time.time()
         if (
             self.config.enable_stagnation_resets
@@ -150,100 +169,112 @@ class PPOTrainer:
         self.checkpoint_interval = max(0, int(interval)) if interval else 0
 
     def train(self) -> None:
-        obs, _ = self.env.reset()
-        obs_tensor = self._obs_to_tensor(obs)
-        last_done = torch.zeros(1, device=self.device)
+        initial_observations = []
+        for env in self.envs:
+            obs, _ = env.reset()
+            initial_observations.append(obs)
+        obs_tensor = self._obs_to_tensor(np.stack(initial_observations))
+        last_done = torch.zeros(self.num_envs, device=self.device)
 
         rollout_steps = self.config.rollout_steps
-        num_updates = math.ceil(self.config.total_timesteps / rollout_steps)
+        steps_per_update = rollout_steps * self.num_envs
+        num_updates = max(1, math.ceil(self.config.total_timesteps / steps_per_update))
+
+        episode_rewards = [0.0 for _ in range(self.num_envs)]
+        current_episode_lengths = self._ongoing_episode_lengths[:]
 
         for update in range(1, num_updates + 1):
             update_start = time.time()
             buffer = RolloutBuffer(
-                rollout_steps, self.env.observation_space.shape, self.device.type
+                rollout_steps, self.num_envs, self.obs_shape, self.device.type
             )
-            episode_reward = 0.0
-            steps_collected = 0
             reward_sums: Dict[str, float] = defaultdict(float)
             reward_counts: Dict[str, int] = defaultdict(int)
-            update_episode_returns: list[float] = []
-            update_episode_lengths: list[int] = []
-            current_episode_length = self._ongoing_episode_length
-            furthest_world = 0
-            furthest_level = 0
-            current_world = 0
-            current_level = 0
+            update_episode_returns: List[float] = []
+            update_episode_lengths: List[int] = []
+            furthest_worlds = [0 for _ in range(self.num_envs)]
+            furthest_levels = [0 for _ in range(self.num_envs)]
+            current_worlds = [0 for _ in range(self.num_envs)]
+            current_levels = [0 for _ in range(self.num_envs)]
             full_restart_events = 0
+            steps_collected = 0
 
             for _ in range(rollout_steps):
                 with torch.no_grad():
-                    action, log_prob, value = self.model.act(obs_tensor)
+                    actions, log_probs, values = self.model.act(obs_tensor)
 
-                next_obs, reward, terminated, truncated, info = self.env.step(
-                    action.item()
-                )
-                done = terminated or truncated
-                episode_reward += reward
-                steps_collected += 1
-                current_episode_length += 1
+                actions_cpu = actions.detach().cpu().numpy()
+                rewards_step = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+                dones_step = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+                next_observations: List[np.ndarray] = []
 
-                reward_sums["total_reward"] += float(reward)
-                reward_counts["total_reward"] += 1
+                for env_idx, env in enumerate(self.envs):
+                    next_obs, reward, terminated, truncated, info = env.step(int(actions_cpu[env_idx]))
+                    done = terminated or truncated
 
-                reward_components = info.get("reward_components") or {}
-                for key, value in reward_components.items():
-                    reward_sums[key] += float(value)
-                    reward_counts[key] += 1
+                    episode_rewards[env_idx] += reward
+                    current_episode_lengths[env_idx] += 1
 
-                world = info.get("current_world") or info.get("world")
-                level = info.get("current_level") or info.get("level")
-                if world is not None:
-                    current_world = int(world)
+                    reward_sums["total_reward"] += float(reward)
+                    reward_counts["total_reward"] += 1
+
+                    reward_components = info.get("reward_components") or {}
+                    for key, value in reward_components.items():
+                        reward_sums[key] += float(value)
+                        reward_counts[key] += 1
+
+                    world = info.get("current_world") or info.get("world")
+                    level = info.get("current_level") or info.get("level")
+                    if world is not None:
+                        current_worlds[env_idx] = int(world)
                     if level is not None:
-                        current_level = int(level)
+                        current_levels[env_idx] = int(level)
 
-                furthest_world_info = info.get("furthest_world")
-                furthest_level_info = info.get("furthest_level")
-                if furthest_world_info is not None:
-                    f_world = int(furthest_world_info)
-                    f_level = int(furthest_level_info or 0)
-                    if f_world > furthest_world or (
-                        f_world == furthest_world and f_level > furthest_level
-                    ):
-                        furthest_world = f_world
-                        furthest_level = f_level
+                    furthest_world_info = info.get("furthest_world")
+                    furthest_level_info = info.get("furthest_level")
+                    if furthest_world_info is not None:
+                        furthest_worlds[env_idx] = int(furthest_world_info)
+                        if furthest_level_info is not None:
+                            furthest_levels[env_idx] = int(furthest_level_info)
 
-                if info.get("full_game_restart"):
-                    full_restart_events += 1
+                    if info.get("full_game_restart"):
+                        full_restart_events += 1
+
+                    rewards_step[env_idx] = float(reward)
+                    dones_step[env_idx] = 1.0 if done else 0.0
+
+                    if done:
+                        update_episode_returns.append(episode_rewards[env_idx])
+                        update_episode_lengths.append(current_episode_lengths[env_idx])
+                        self.episode_returns.append(episode_rewards[env_idx])
+                        episode_rewards[env_idx] = 0.0
+                        current_episode_lengths[env_idx] = 0
+
+                        final_info = info
+                        next_obs, reset_info = env.reset()
+                        reset_info["terminal_info"] = final_info
+                        info = reset_info
+
+                    next_observations.append(next_obs)
 
                 buffer.add(
-                    obs_tensor.squeeze(0),
-                    action,
-                    log_prob,
-                    reward,
-                    value,
-                    done,
+                    obs_tensor.detach().clone(),
+                    actions.detach().clone(),
+                    log_probs.detach().clone(),
+                    rewards_step,
+                    values.detach().clone(),
+                    dones_step,
                 )
 
-                self.global_step += 1
-                obs_tensor = self._obs_to_tensor(next_obs)
+                obs_tensor = self._obs_to_tensor(np.stack(next_observations))
+                last_done = dones_step
+                self.global_step += self.num_envs
+                steps_collected += self.num_envs
 
-                if done:
-                    update_episode_returns.append(episode_reward)
-                    update_episode_lengths.append(current_episode_length)
-                    self.episode_returns.append(episode_reward)
-                    episode_reward = 0.0
-                    current_episode_length = 0
-                    next_obs, _ = self.env.reset()
-                    obs_tensor = self._obs_to_tensor(next_obs)
-                    last_done = torch.ones(1, device=self.device)
-                else:
-                    last_done = torch.zeros(1, device=self.device)
-
-            self._ongoing_episode_length = current_episode_length
+            self._ongoing_episode_lengths = current_episode_lengths[:]
 
             with torch.no_grad():
-                _, _, last_value = self.model.act(obs_tensor)
+                _, last_value = self.model.get_policy_and_value(obs_tensor)
             buffer.compute_returns_and_advantages(
                 last_value.detach(), last_done, self.config
             )
@@ -276,9 +307,14 @@ class PPOTrainer:
                     len(self._stagnation_window) == self._stagnation_window.maxlen
                     and not any(self._stagnation_window)
                 ):
-                    obs, _ = self.env.reset()
-                    obs_tensor = self._obs_to_tensor(obs)
-                    last_done = torch.zeros(1, device=self.device)
+                    refreshed_observations = []
+                    for idx, env in enumerate(self.envs):
+                        obs, _ = env.reset()
+                        refreshed_observations.append(obs)
+                        episode_rewards[idx] = 0.0
+                        current_episode_lengths[idx] = 0
+                    obs_tensor = self._obs_to_tensor(np.stack(refreshed_observations))
+                    last_done = torch.zeros(self.num_envs, device=self.device)
                     self._stagnation_window.clear()
                     stagnation_reset_triggered = True
 
@@ -310,8 +346,8 @@ class PPOTrainer:
                 f"avg_return={avg_return:.2f} "
                 f"mean_reward={reward_mean_per_step:.4f} "
                 f"episodes={episodes_completed} "
-                f"curr=W{current_world}-L{current_level} "
-                f"furthest=W{furthest_world}-L{furthest_level}"
+                f"curr=W{max(current_worlds, default=0)}-L{max(current_levels, default=0)} "
+                f"furthest=W{max(furthest_worlds, default=0)}-L{max(furthest_levels, default=0)}"
                 + (" [stagnation reset]" if stagnation_reset_triggered else "")
             )
 
@@ -334,10 +370,10 @@ class PPOTrainer:
                     "total_reward_sum": total_reward_sum,
                     "stagnation_reset": int(stagnation_reset_triggered),
                     "elapsed_s": time.time() - self.training_start,
-                    "current_world": current_world,
-                    "current_level": current_level,
-                    "furthest_world": furthest_world,
-                    "furthest_level": furthest_level,
+                    "current_world": max(current_worlds, default=0),
+                    "current_level": max(current_levels, default=0),
+                    "furthest_world": max(furthest_worlds, default=0),
+                    "furthest_level": max(furthest_levels, default=0),
                     "full_game_restart_events": full_restart_events,
                 }
                 self.logger.log_update(metrics, reward_stats)
@@ -402,20 +438,27 @@ class PPOTrainer:
 
     def _obs_to_tensor(self, obs: np.ndarray) -> torch.Tensor:
         tensor = torch.from_numpy(obs).to(self.device, dtype=torch.float32) / 255.0
-        return tensor.unsqueeze(0)
+        if tensor.ndim == len(self.obs_shape):
+            tensor = tensor.unsqueeze(0)
+        return tensor
 
     def _update_policy(self, buffer: RolloutBuffer) -> Dict[str, float]:
         losses: Dict[str, float] = {}
-        advantages = buffer.advantages.clone()
+        obs_flat = buffer.obs.reshape(-1, *self.obs_shape).detach()
+        actions_flat = buffer.actions.reshape(-1)
+        old_log_probs_flat = buffer.log_probs.reshape(-1)
+        returns_flat = buffer.returns.reshape(-1)
+        advantages = buffer.advantages.reshape(-1).clone()
+
         if self.config.normalize_advantages:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         for _ in range(self.config.update_epochs):
             for indices in buffer.get_batches(self.config.mini_batch_size):
-                obs_batch = buffer.obs[indices]
-                action_batch = buffer.actions[indices]
-                old_log_probs = buffer.log_probs[indices]
-                returns_batch = buffer.returns[indices]
+                obs_batch = obs_flat[indices]
+                action_batch = actions_flat[indices]
+                old_log_probs = old_log_probs_flat[indices]
+                returns_batch = returns_flat[indices]
                 adv_batch = advantages[indices]
 
                 new_log_probs, entropy, values = self.model.evaluate_actions(
