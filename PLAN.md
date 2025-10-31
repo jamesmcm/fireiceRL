@@ -18,7 +18,7 @@ The foundation of this project lies in establishing a robust communication chann
 
 **1.2. Python-fceux Bridge:**
 
-Leveraging existing projects that have successfully bridged Python and fceux is highly recommended. Frameworks like `fceux2openai` and `gym-nes-mario-bros` provide excellent starting points. These typically involve a Lua script that runs within fceux to read memory addresses, VRAM, and send controller inputs via sockets, and a Python wrapper to interact with this script.
+Leveraging existing projects that have successfully bridged Python and fceux is highly recommended. Frameworks like `fceux2openai` and `gym-nes-mario-bros` provide excellent starting points. Our bridge extends these ideas with a dedicated level-loader command: the Lua script listens for reset requests, applies a savestate, writes the target world/level directly into RAM, and resumes play without ever showing menus to the agent.
 
 **1.3. The Lua Connection:**
 
@@ -26,7 +26,8 @@ A custom Lua script will be the heart of the emulator-side interaction. This scr
 
 *   **Memory Monitoring:** Continuously read the crucial RAM addresses you've identified to track game state.
 *   **VRAM Extraction:** Capture the raw pixel data from the VRAM.
-*   **Controller Input:** Receive commands from the Python agent and translate them into controller inputs (left, right, A, B, start).
+*   **Controller Input:** Receive commands from the Python agent and translate them into on-level controller inputs (left, right, A); menu buttons are no longer required because resets skip straight into gameplay.
+*   **Level Injection:** Handle `reset`/`restart_level` commands from Python by restoring a clean savestate and force-writing the requested world/level so the agent spawns directly in the stage.
 *   **Communication:** Send the collected game state information (VRAM and RAM values) to the Python script and receive actions in return, likely using ZeroMQ sockets.
 
 ### Step 2: Crafting the Brain - The PPO Agent
@@ -47,7 +48,7 @@ A typical CNN architecture for this purpose might consist of:
 
 The output of the CNN will be fed into two separate fully connected networks:
 
-*   **Policy Network (Actor):** This network will output the probabilities of taking each possible action (left, right, A, and potentially B and start for menu navigation).
+*   **Policy Network (Actor):** This network will output the probabilities of taking each possible in-level action (left, right, A).
 *   **Value Network (Critic):** This network will estimate the expected cumulative reward from the current state, helping to guide the policy network's learning.
 
 Proximal Policy Optimization is a policy gradient method that is known for its stability and sample efficiency, making it a strong choice for this complex task.
@@ -64,13 +65,12 @@ A well-designed reward function is paramount to the success of any reinforcement
 
 **3.2. Penalties and Incentives for Efficient Play:**
 
-*   **Penalizing In-Menu Time:** To discourage the agent from lingering in menus, a small negative reward should be applied for every frame the agent is not in a level. This can be determined by checking the values at addresses `$0018`, `$001C`, and `$00D0`.
+*   **Level Entry Guardrails:** Because resets inject the agent directly into a stage, any time spent out of level is unexpected. Track `$0018`, `$001C`, and `$00D0` as assertions rather than as a reward component so you can raise alerts if the loader ever drops the agent back to a menu.
 *   **Pause Awareness:** Addresses `$031D` and `$0321` are set to `1` while a level is paused. A mild penalty per paused frame can deter unnecessary pausing without preventing deliberate restarts.
 *   **Death Detection:** Address `$0003` equals `8` during the death animation. Treating the rising edge of this flag as a terminal signal allows penalties (and optional resets) for failed attempts without interfering with normal level completion.
-*   **Menu Entry Reward:** Addresses `$0324`/`$0328` light up on the level-select menu. A one-off reward after a reset encourages the policy to progress from the title/menu sequence into actual levels.
-*   **Discouraging Re-entry of Completed Levels:** The agent needs to be penalized for entering a level that has already been completed. This can be achieved by checking the corresponding bit in the world completion bitmask (`$0400` range) before entering a level. If the bit is already set, a negative reward should be applied.
-*   **Encouraging Exploration of Uncompleted Levels:** To nudge the agent towards new challenges, a small initial positive reward can be given upon entering a level that has not yet been completed.
-*   **Level Select Detection:** Memory addresses `$0324` and `$0328` are set to `1` while the level-select menu is shown. These flags can be used to avoid accidental episode termination or to modulate penalties while navigating menus.
+*   **Completed Level Penalty:** Penalize attempts to re-enter a cleared level by checking the matching bit in the world completion bitmask (`$0400` range) before allowing a jump.
+*   **Exploration Incentive:** To nudge the agent towards new challenges, provide a small initial positive reward when dropping into a level that has not yet been completed.
+*   **Menu State Monitoring:** Memory addresses `$0324` and `$0328` still toggle on the level-select menu; log them for diagnostics but avoid rewarding or penalizing them since the loader should keep the agent away from menus entirely.
 
 **3.3. Reward Function Implementation:**
 
@@ -80,7 +80,7 @@ The reward function will be implemented in the Python script. After each action,
 
 The main training loop will orchestrate the interaction between the agent and the game environment. Here's a high-level overview of the process:
 
-1.  **Initialization:** Launch the fceux emulator with the *Fire 'n Ice* ROM and the Lua script. The Python script will connect to the emulator.
+1.  **Initialization:** Launch the fceux emulator with the *Fire 'n Ice* ROM and the Lua bridge script. When Python sends its first `reset`, the Lua side restores the configured savestate, overwrites the target world/level bytes, and drops the agent straight into the requested stage.
 2.  **Observation:** The Python script will receive the initial game state, including the VRAM pixel data and the relevant RAM values.
 3.  **Preprocessing:** The VRAM data will be preprocessed (e.g., resized, converted to grayscale) before being fed into the agent's CNN.
 4.  **Action Selection:** The PPO agent will process the preprocessed VRAM and other state information to select an action based on its current policy.
@@ -91,24 +91,20 @@ The main training loop will orchestrate the interaction between the agent and th
 9.  **PPO Update:** Periodically, the agent will use the collected data to update its policy and value networks using the PPO algorithm.
 10. **Repeat:** This process will repeat for thousands or even millions of frames, allowing the agent to gradually learn and improve its gameplay.
 
-### Step 5: Action Space and Menu Navigation
+### Step 5: Action Space and Menu Handling
 
-**5.1. In-Game Actions:**
+**5.1. Core Actions:**
 
-For the core gameplay, the action space will be discrete and consist of:
+For the core gameplay, the discrete action space covers what the agent needs on every stage:
 
+*   `noop`
 *   `left`
 *   `right`
-*   `A` (for creating and pushing ice blocks)
+*   `A` (creating and pushing ice blocks)
 
-**5.2. Menu Navigation:**
+**5.2. Script-Driven Resets:**
 
-To handle menu screens, the action space will need to be expanded to include:
-
-*   `B`
-*   `start`
-
-A state-based approach can be used to determine when to use the menu navigation actions. For example, by monitoring the `in-level` memory addresses, the agent can switch to a "menu mode" with the expanded action space when not in a level.
+The Lua loader is responsible for every transition back into a level. Resets and stagnation restarts always restore the savestate, write the desired world/level, and resume the stage. Because of this automation the agent never presses `start` or `B`, and any appearance of menus should be treated as a bug in the loader rather than as behaviour to be learned.
 
 By following these steps and leveraging the provided memory addresses, you can successfully implement a PPO reinforcement learning agent capable of learning to play and master the challenging puzzles of *Fire 'n Ice*. This project combines the power of deep reinforcement learning with the intricacies of classic game emulation, offering a rewarding and educational experience.
 

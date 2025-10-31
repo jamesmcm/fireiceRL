@@ -1,10 +1,11 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `fireicerl/`: Core Python package. Notable modules include `bridge.py` (ZeroMQ bridge to FCEUX), `environment.py` (Gymnasium wrapper), `reward.py` (reward shaping), and `ppo.py` (training loop).
-- `lua/fireice_bridge.lua`: Lua script loaded inside FCEUX to stream frames, RAM, and events.
+- `fireicerl/`: Core Python package. Notable modules include `bridge.py` (ZeroMQ bridge to FCEUX), `environment.py` (Gymnasium wrapper that drives direct level loads), `reward.py` (reward shaping), and `ppo.py` (training loop).
+- `lua/fireice_bridge.lua`: Lua script loaded inside FCEUX to stream frames, RAM, events, and force levels to load directly without visiting menus.
 - `main.py`: CLI entry point for training (`uv run python main.py …`).
 - `logs/`, `checkpoints/`: Created during training for metrics and model snapshots (configurable via CLI).
+- `roms/1-1-nounlock.sav`: Baseline savestate used by the loader when jumping straight into a level.
 - `PLAN.md`, `notes.txt`: Design notes and memory map references.
 
 ## Build, Test, and Development Commands
@@ -24,6 +25,7 @@
 - No formal test suite yet; use `compileall` smoke test before committing.
 - Validate training runs by examining `logs/*/metrics.csv` and `reward_components.csv`.
 - When adding reward logic, include unit-style assertions or temporary scripts to verify new components (remove before commit).
+- During manual runs, confirm `reset`/`restart_level` drop the agent directly into the requested stage; menu screens indicate a regression in the loader or savestate.
 
 ## Commit & Pull Request Guidelines
 - Commit messages: imperative mood (e.g., “Add stagnation reset logic”), scope prefix optional.
